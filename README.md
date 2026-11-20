@@ -9,11 +9,13 @@ A high-throughput, resilient, and multi-tenant background engine for moving up t
 To bring up the MongoDB database, run the complete automated test suite, seed initial datasets, and start the service on a clean machine:
 
 ```bash
-docker compose up
+docker compose up --build
 ```
 
 Once up, the API is available at:
 `http://localhost:3000`
+
+> **Note:** The Docker compose pipeline automatically runs the test suite, seeds the database with 512,500 deals across 6 workspaces, and starts the background workers.
 
 ---
 
@@ -211,6 +213,122 @@ X-Workspace-Id: ws-large-1
   "lastHeartbeatAt": "2026-11-20T13:30:03.500Z",
   "errorMessage": null
 }
+```
+
+---
+
+## Verification & Testing Guide (cURL Commands)
+
+Use these copy-pasteable cURL commands to test and verify all five core requirements on a running instance (`http://localhost:3000`).
+
+### 1. Health Check & Foundation APIs
+```bash
+# Health Check
+curl -s http://localhost:3000/health
+
+# List deals in a stage (with pagination)
+curl -s -H "X-Workspace-Id: ws-large-1" \
+  "http://localhost:3000/opportunities?stage=stage-1&page=1&limit=5"
+
+# Create a single opportunity
+curl -s -X POST http://localhost:3000/opportunities \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace-Id: ws-large-1" \
+  -d '{"name":"Enterprise Expansion","monetaryValue":25000,"stageId":"stage-1","ownerId":"rep-alice"}'
+
+# Move a single opportunity stage (records transition audit log)
+curl -s -X PATCH http://localhost:3000/opportunities/<OPPORTUNITY_ID>/stage \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace-Id: ws-large-1" \
+  -d '{"toStageId":"stage-2"}'
+```
+
+### 2. Requirement 3: Large Batch Handling (> 50,000 Limit)
+When matching deals exceed the 50,000 limit (`stage-1` contains ~110,000 seeded deals), the API rejects the request immediately with **HTTP 422 Unprocessable Entity**:
+```bash
+curl -i -X POST http://localhost:3000/bulk-jobs \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace-Id: ws-large-1" \
+  -d '{"filter":{"stageId":"stage-1"},"targetStageId":"stage-2"}'
+```
+*Expected Response:*
+```json
+HTTP/1.1 422 Unprocessable Entity
+{"error":"Batch size exceeds maximum allowed limit of 50,000 matching deals (found 110,318)","matchingCount":110318,"maxLimit":50000}
+```
+
+### 3. Requirement 4: Submit a Valid Bulk Move ($\le$ 50,000 Deals)
+Submit a targeted filter within the limit (`ownerId: rep-charlie` matches ~22,000 deals) -> Returns **HTTP 201 Created**:
+```bash
+curl -i -X POST http://localhost:3000/bulk-jobs \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace-Id: ws-large-1" \
+  -H "Idempotency-Key: client-req-001" \
+  -d '{"filter":{"stageId":"stage-1","ownerId":"rep-charlie"},"targetStageId":"stage-2"}'
+```
+*Expected Response:*
+```json
+HTTP/1.1 201 Created
+{"id":"<JOB_ID>","workspaceId":"ws-large-1","status":"queued","totalCount":21769,"idempotentReplay":false}
+```
+
+### 4. Requirement 3 & 5: Poll Committed Progress & Resumability
+Inspect real-time progress, keyset cursor, and liveness:
+```bash
+curl -s http://localhost:3000/bulk-jobs/<JOB_ID> \
+  -H "X-Workspace-Id: ws-large-1"
+```
+*Expected Response (when completed):*
+```json
+{
+  "id": "<JOB_ID>",
+  "workspaceId": "ws-large-1",
+  "status": "completed",
+  "liveness": "healthy",
+  "totalCount": 21769,
+  "processedCount": 21769,
+  "updatedCount": 21769,
+  "skippedCount": 0,
+  "progressPercent": 100,
+  "cursor": "6b008eaf69f86cb49a59a261"
+}
+```
+
+### 5. Requirement 4: Idempotency & Replay Protection
+- **Identical Replay:** Resending the exact same request with the same `Idempotency-Key` safely returns the existing job with **HTTP 200 OK**:
+```bash
+curl -i -X POST http://localhost:3000/bulk-jobs \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace-Id: ws-large-1" \
+  -H "Idempotency-Key: client-req-001" \
+  -d '{"filter":{"stageId":"stage-1","ownerId":"rep-charlie"},"targetStageId":"stage-2"}'
+```
+*Response contains: `"idempotentReplay": true` with `HTTP 200 OK`.*
+
+- **Key Reuse with Mismatch:** Reusing the same key with different parameters returns **HTTP 409 Conflict**:
+```bash
+curl -i -X POST http://localhost:3000/bulk-jobs \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace-Id: ws-large-1" \
+  -H "Idempotency-Key: client-req-001" \
+  -d '{"filter":{"stageId":"stage-1","ownerId":"rep-bob"},"targetStageId":"stage-2"}'
+```
+
+### 6. Requirement 2: Target Stage Validation & Security Guards
+- **Identical Source & Destination Stage:** Returns **HTTP 400 Bad Request**:
+```bash
+curl -i -X POST http://localhost:3000/bulk-jobs \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace-Id: ws-large-1" \
+  -d '{"filter":{"stageId":"stage-1"},"targetStageId":"stage-1"}'
+```
+
+- **Anti-NoSQL Injection Guard:** Object operator injection in filters is blocked with **HTTP 400 Bad Request**:
+```bash
+curl -i -X POST http://localhost:3000/bulk-jobs \
+  -H "Content-Type: application/json" \
+  -H "X-Workspace-Id: ws-large-1" \
+  -d '{"filter":{"stageId":"stage-1","ownerId":{"$ne":null}},"targetStageId":"stage-2"}'
 ```
 
 ---
