@@ -11,6 +11,7 @@ export interface IOpportunity extends Document {
   status: OpportunityStatus;
   ownerId: string;
   lastManualStageChangeAt?: Date | null;
+  lastBulkJobId?: Types.ObjectId | null;
   version: number;
   createdAt: Date;
   updatedAt: Date;
@@ -31,6 +32,7 @@ const OpportunitySchema = new Schema<IOpportunity>(
     },
     ownerId: { type: String, required: true, index: true },
     lastManualStageChangeAt: { type: Date, default: null },
+    lastBulkJobId: { type: Schema.Types.ObjectId },
     version: { type: Number, default: 1 },
   },
   {
@@ -51,6 +53,12 @@ OpportunitySchema.index({
   createdAt: 1,
   _id: 1,
 });
+
+// Crash-recovery repair: finds deals a job moved past its committed cursor
+OpportunitySchema.index(
+  { workspaceId: 1, lastBulkJobId: 1, _id: 1 },
+  { partialFilterExpression: { lastBulkJobId: { $type: 'objectId' } } }
+);
 
 // Tenant point lookup index
 OpportunitySchema.index({ workspaceId: 1, _id: 1 });

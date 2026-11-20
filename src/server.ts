@@ -1,6 +1,6 @@
 import { createApp } from './app';
 import { connectDB, disconnectDB } from './config/db';
-import { defaultWorker } from './services/worker.service';
+import { WorkerEngine } from './services/worker.service';
 import { config } from './config';
 
 async function bootstrap() {
@@ -8,8 +8,9 @@ async function bootstrap() {
   console.log(`[Database] Connected to MongoDB at ${config.mongoUri}`);
 
   // Start background worker loop
-  defaultWorker.start(500);
-  console.log(`[Worker] Started background worker engine: ${defaultWorker.workerId}`);
+  const workers = Array.from({ length: Math.max(1, config.workerConcurrency) }, () => new WorkerEngine());
+  workers.forEach((w) => w.start(500));
+  console.log(`[Worker] Started ${workers.length} worker(s): ${workers.map((w) => w.workerId).join(', ')}`);
 
   const app = createApp();
   const server = app.listen(config.port, () => {
@@ -18,7 +19,7 @@ async function bootstrap() {
 
   const shutdown = async (signal: string) => {
     console.log(`\n[Server] Received ${signal}. Gracefully shutting down...`);
-    defaultWorker.stop();
+    workers.forEach((w) => w.stop());
     server.close(async () => {
       await disconnectDB();
       console.log('[Server] Successfully shut down.');

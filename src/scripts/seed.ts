@@ -55,9 +55,9 @@ export async function seedDatabase(options?: { largeCount?: number; smallCount?:
   // Ensure indexes are built
   console.log('[Seed] Building indexes...');
   await Promise.all([
-    Opportunity.createIndexes(),
-    BulkJob.createIndexes(),
-    OpportunityStageTransition.createIndexes(),
+    Opportunity.syncIndexes(),
+    BulkJob.syncIndexes(),
+    OpportunityStageTransition.syncIndexes(),
   ]);
 
   // 1. Create Workspaces

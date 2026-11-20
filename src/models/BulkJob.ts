@@ -16,7 +16,11 @@ export interface IBulkJobFilter {
 export interface IBulkJob extends Document {
   _id: Types.ObjectId;
   workspaceId: string;
-  idempotencyKey: string;
+  idempotencyKey?: string | null;
+  fingerprint: string;
+  active: boolean;
+  attempts: number;
+  nextAttemptAt?: Date | null;
   status: BulkJobStatus;
   filter: IBulkJobFilter;
   targetStageId: string;
@@ -55,7 +59,13 @@ const BulkJobFilterSchema = new Schema<IBulkJobFilter>(
 const BulkJobSchema = new Schema<IBulkJob>(
   {
     workspaceId: { type: String, required: true, index: true },
-    idempotencyKey: { type: String, required: true },
+    // Client-supplied key: dedupes for the lifetime of the job record
+    idempotencyKey: { type: String, default: null },
+    // Canonical hash of workspace + filter + target: dedupes only while the job is active
+    fingerprint: { type: String, required: true },
+    active: { type: Boolean, default: true },
+    attempts: { type: Number, default: 0 },
+    nextAttemptAt: { type: Date, default: null },
     status: {
       type: String,
       required: true,
@@ -86,8 +96,23 @@ const BulkJobSchema = new Schema<IBulkJob>(
   }
 );
 
-// Idempotency: Workspace + IdempotencyKey must be globally unique
-BulkJobSchema.index({ workspaceId: 1, idempotencyKey: 1 }, { unique: true });
+// Idempotency (client key): unique per workspace for client-supplied keys
+BulkJobSchema.index(
+  { workspaceId: 1, idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }
+);
+
+// Idempotency (implicit): only one active job per identical request
+BulkJobSchema.index(
+  { workspaceId: 1, fingerprint: 1 },
+  { unique: true, partialFilterExpression: { active: true } }
+);
+
+// Hard per-workspace cap: at most one job in 'processing' per workspace, enforced by the database
+BulkJobSchema.index(
+  { workspaceId: 1 },
+  { unique: true, partialFilterExpression: { status: 'processing' }, name: 'one_processing_job_per_workspace' }
+);
 
 // Scavenger & Worker claiming index
 BulkJobSchema.index({ status: 1, leaseExpiresAt: 1 });

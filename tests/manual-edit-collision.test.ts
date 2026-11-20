@@ -1,6 +1,6 @@
 import request from 'supertest';
 import { createApp } from '../src/app';
-import { setupTestDB, teardownTestDB } from './setup';
+import { setupTestDB, teardownTestDB, registerWorkspace } from './setup';
 import { Opportunity } from '../src/models/Opportunity';
 import { OpportunityStageTransition } from '../src/models/OpportunityStageTransition';
 import { WorkerEngine } from '../src/services/worker.service';
@@ -11,6 +11,7 @@ const app = createApp();
 describe('Requirement 1: Manual Edit Handling & Collision Safety (A->B->A)', () => {
   beforeAll(async () => {
     await setupTestDB();
+    await registerWorkspace('ws-collision-test', ['stage-A','stage-TARGET']);
   });
 
   afterAll(async () => {

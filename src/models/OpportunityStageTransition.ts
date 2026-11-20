@@ -33,6 +33,12 @@ const OpportunityStageTransitionSchema = new Schema<IOpportunityStageTransition>
 
 OpportunityStageTransitionSchema.index({ workspaceId: 1, opportunityId: 1, createdAt: -1 });
 
+// A bulk job records at most one transition per deal, which makes transition writes replay-safe
+OpportunityStageTransitionSchema.index(
+  { jobId: 1, opportunityId: 1 },
+  { unique: true, partialFilterExpression: { jobId: { $type: 'objectId' } } }
+);
+
 export const OpportunityStageTransition = mongoose.model<IOpportunityStageTransition>(
   'OpportunityStageTransition',
   OpportunityStageTransitionSchema

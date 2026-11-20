@@ -73,20 +73,18 @@ db.opportunities.createIndex({ workspaceId: 1, stageId: 1, _id: 1 })
 - **Index Scan**: The query performs an `IXSCAN` directly into the leaf nodes of the B-tree, fetching only matching document pointers.
 
 ### 2.4 How the Cursor Survives a Restart
-At the end of each chunk of 500 records:
-1. `bulkWrite` updates the opportunities and inserts transition audit logs.
-2. The last processed `_id` in the chunk is saved to `BulkJob.cursor` along with an atomic increment of `processedCount` and `updatedCount`:
-   ```typescript
-   await BulkJob.updateOne(
-     { _id: job._id },
-     {
-       $set: { cursor: lastOppIdInChunk, lastHeartbeatAt: new Date() },
-       $inc: { processedCount: chunkLength, updatedCount: chunkUpdated, skippedCount: chunkSkipped }
-     }
-   );
-   ```
-3. If the worker crashes immediately after this write, the cursor is safely persisted in MongoDB.
-4. When work resumes, the new worker queries `_id > job.cursor`. All previously committed chunks (e.g. 1 through 30,000) are skipped at $O(1)$ index seek speed, and processing resumes at record 30,001.
+Standalone MongoDB gives no multi-document transactions, so crash safety comes from write ordering plus idempotent repair instead. Per chunk of 500 records:
+1. `bulkWrite` moves the deals. The same write stamps each moved deal with `lastBulkJobId = job._id` (guarded by `version` and `lastManualStageChangeAt`).
+2. Transitions are inserted for exactly the deals carrying this job's stamp. A partial unique index on `{ jobId, opportunityId }` makes this replay-safe (duplicate-key errors are ignored), and a deal a user moved into the target stage concurrently has no stamp, so it gets no `bulk_job` transition.
+3. Cursor and counters are committed together in one fenced update (`{ _id, workerId, status: 'processing' }`), which also renews the lease and resets the consecutive-failure counter.
+
+**Crash windows.** If the worker dies after step 1 or 2 but before step 3, the cursor is behind the real state. On resume, `repairUncommittedChunk` finds deals stamped by this job with `_id > cursor` (served by the `{ workspaceId, lastBulkJobId, _id }` partial index), backfills their missing transitions, and re-derives `updatedCount` from the transition count. Deals already moved no longer match `stageId = source`, so they are never moved twice. At completion, `updatedCount` is recomputed from committed transitions rather than trusting incremental counters.
+
+**Fencing.** Every job write filters on `workerId`. A worker that stalls past its lease and wakes up after another worker took over gets no match, throws `LeaseLostError`, and abandons the job without touching cursor or counters.
+
+When work resumes, the new worker queries `_id > job.cursor`; committed chunks are skipped at index-seek speed.
+
+**Retries.** A thrown error (e.g. dropped DB connection) requeues the job with exponential backoff + jitter (`RETRY_BASE_DELAY_MS`, `nextAttemptAt`), keeping the cursor. After `MAX_JOB_ATTEMPTS` consecutive failures without progress, the job becomes `failed`. A job that repeatedly kills its worker is failed the same way on recovery (`attempts` is incremented per recovery claim).
 
 ---
 
@@ -98,19 +96,23 @@ The idempotency model supports two modes:
 2. **Deterministic Fingerprint**: If no header is provided, the server derives a SHA-256 fingerprint from the canonical tuple:
    $$\text{Fingerprint} = \text{SHA256}(\text{workspaceId} + \text{canonicalJSON}(\text{filter}) + \text{targetStageId})$$
 
-The key is stored in the `BulkJob` collection under the field `idempotencyKey`, backed by a compound unique index:
+Both are stored on the `BulkJob` document and enforced by partial unique indexes:
 ```javascript
-db.bulkjobs.createIndex({ workspaceId: 1, idempotencyKey: 1 }, { unique: true })
+// client key: unique per workspace, permanent
+db.bulkjobs.createIndex({ workspaceId: 1, idempotencyKey: 1 }, { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } })
+// implicit fingerprint: unique only while the job is active (queued/processing)
+db.bulkjobs.createIndex({ workspaceId: 1, fingerprint: 1 }, { unique: true, partialFilterExpression: { active: true } })
 ```
+Reusing a client key with a *different* request returns `409`.
 
 ### 3.2 What It Protects
 - **Network Retries**: If a mobile or web client sends a request and the HTTP connection drops before the client receives the 201 response, a subsequent retry sends the same `Idempotency-Key`. The server intercepts the duplicate key, queries the existing job, and returns HTTP 200 OK with the original job handle.
 - **Concurrent Submissions**: If a user double-clicks or multiple distributed services submit identical jobs simultaneously, MongoDB's unique index guarantees that exactly one `insert` succeeds. The losing threads receive a duplicate key error (`E11000`), catch it, and return the winner's job handle.
-- **Lifecycle Protection**: Idempotency is maintained throughout the job lifecycle. Re-submitting the same key while the job is `queued`, `processing`, or `completed` will never launch a second job.
+- **Lifecycle Protection**: Idempotency is maintained throughout the job lifecycle. A client key never launches a second job, in any state. Without a key, an identical request returns the in-flight job while it is `queued`/`processing`; once it is `completed`/`failed` the same filter is treated as a new request (deals may have arrived since).
 
 ### 3.3 Where a Retry Could Still Slip Through
 1. **Filter Semantics Drift**: If the client submits two identical logical requests with non-canonical filter variations (e.g., omitted default values or floating timestamp changes like `startDate: new Date()`), the computed fingerprint may differ if explicit `Idempotency-Key` is omitted.
-2. **Tenant Re-execution Window**: If a client deliberately wants to move a set of deals that entered the stage *after* the previous job completed, reusing the same idempotency key will return the old completed job instead of moving the new deals. Clients must generate a new key for new business intents.
+2. **Implicit Replay After Completion**: Without an `Idempotency-Key`, a retry that arrives after the first job already finished starts a second job. It is harmless for stage moves (nothing left to move, so it completes with 0 updates), but clients that need strict replay semantics must send a key.
 
 ---
 
@@ -190,8 +192,8 @@ An alternative approach is inserting all 50,000 IDs into a temporary table or ar
 
 ### 6.1 The Mechanism
 1. **Chunk Pacing Delay**: Between each 500-record chunk, the worker introduces an asynchronous pacing delay (`CHUNK_PACING_MS = 20ms`). This yields the Node.js event loop and allows MongoDB's WiredTiger storage engine to flush dirty pages and prioritize interactive read tickets.
-2. **Per-Workspace Concurrency Cap**: A workspace may only have **one active bulk job** executing at any time. If tenant $A$ submits five bulk jobs, only one will be claimed; the remaining four stay in `queued` state until the active job completes.
-3. **Global Concurrency Semaphore**: Total simultaneous executing jobs across the worker pool is capped (e.g. 2 concurrent workers per instance).
+2. **Per-Workspace Concurrency Cap**: A workspace may only have **one `processing` bulk job** at any time, enforced by the database (partial unique index `one_processing_job_per_workspace` on `{ workspaceId }` where `status = 'processing'`), so it holds even when many workers claim simultaneously. Workspaces with a live job are excluded in the claim query, so one tenant's backlog cannot hide other tenants' jobs.
+3. **Global Concurrency Cap**: `WORKER_CONCURRENCY` worker loops run per instance.
 4. **Targeted Compound Indexing**: All interactive endpoints (`GET /opportunities`, `PATCH /opportunities/:id/stage`) query with covered index prefixes (`{ workspaceId: 1, stageId: 1, _id: 1 }`), ensuring interactive queries complete in $<10\text{ms}$ even under bulk load.
 
 ### 6.2 The Hole It Still Leaves

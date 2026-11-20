@@ -1,6 +1,6 @@
 import request from 'supertest';
 import { createApp } from '../src/app';
-import { setupTestDB, teardownTestDB } from './setup';
+import { setupTestDB, teardownTestDB, registerWorkspace } from './setup';
 import { Opportunity } from '../src/models/Opportunity';
 import { OpportunityStageTransition } from '../src/models/OpportunityStageTransition';
 import { BulkJob } from '../src/models/BulkJob';
@@ -14,6 +14,7 @@ describe('Requirement 5: Crash Recovery & Resumability', () => {
 
   beforeAll(async () => {
     await setupTestDB();
+    await registerWorkspace('ws-crash-recovery', ['stage-source','stage-destination']);
     // Set chunk size to 20 for precise multi-chunk crash testing
     config.chunkSize = 20;
     config.leaseDurationMs = 50; // short lease for testing

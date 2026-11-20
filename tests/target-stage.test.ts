@@ -1,6 +1,6 @@
 import request from 'supertest';
 import { createApp } from '../src/app';
-import { setupTestDB, teardownTestDB } from './setup';
+import { setupTestDB, teardownTestDB, registerWorkspace } from './setup';
 import { Opportunity } from '../src/models/Opportunity';
 import { OpportunityStageTransition } from '../src/models/OpportunityStageTransition';
 import { WorkerEngine } from '../src/services/worker.service';
@@ -10,6 +10,7 @@ const app = createApp();
 describe('Requirement 2: Target Stage Validation', () => {
   beforeAll(async () => {
     await setupTestDB();
+    await registerWorkspace('ws-target-validation', ['stage-A','stage-B']);
   });
 
   afterAll(async () => {

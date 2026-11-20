@@ -1,6 +1,7 @@
 import os from 'os';
 import { performance } from 'perf_hooks';
 import { connectDB, disconnectDB } from '../config/db';
+import { Workspace } from '../models/Workspace';
 import { Opportunity } from '../models/Opportunity';
 import { BulkJob } from '../models/BulkJob';
 import { OpportunityStageTransition } from '../models/OpportunityStageTransition';
@@ -43,7 +44,7 @@ function calculatePercentiles(latencies: number[]): LatencyStats {
 
 async function runBenchmarks() {
   console.log('================================================================');
-  console.log('       SDE-3 BULK STAGE MOVE BENCHMARK & MEASUREMENT SUITE       ');
+  console.log('          BULK STAGE MOVE BENCHMARK & MEASUREMENT SUITE         ');
   console.log('================================================================');
   console.log(`Hardware: ${os.cpus()[0]?.model} (${os.cpus().length} vCPUs), ${(os.totalmem() / 1024 / 1024 / 1024).toFixed(1)} GB RAM`);
   console.log(`OS: ${os.type()} ${os.release()} (${os.arch()})`);
@@ -51,6 +52,37 @@ async function runBenchmarks() {
   console.log('================================================================\n');
 
   await connectDB();
+
+  // Register pipeline stages for workspaces so bulk job validation passes
+  await Workspace.updateOne(
+    { _id: 'ws-large-1' },
+    {
+      $set: {
+        name: 'Enterprise Global Corp',
+        stages: [
+          { stageId: 'stage-bench-1', name: 'Benchmark Stage 1', order: 1 },
+          { stageId: 'stage-bench-target', name: 'Benchmark Target Stage', order: 2 },
+          { stageId: 'stage-kill-source', name: 'Kill Source Stage', order: 3 },
+          { stageId: 'stage-kill-dest', name: 'Kill Dest Stage', order: 4 },
+        ],
+      },
+    },
+    { upsert: true }
+  );
+
+  await Workspace.updateOne(
+    { _id: 'ws-small-1' },
+    {
+      $set: {
+        name: 'Startup Ventures 1',
+        stages: [
+          { stageId: 'stage-bench-1', name: 'Benchmark Stage 1', order: 1 },
+          { stageId: 'stage-bench-target', name: 'Benchmark Target Stage', order: 2 },
+        ],
+      },
+    },
+    { upsert: true }
+  );
 
   // 1. Prepare target 50,000 dataset for Benchmark 1
   console.log('[Setup] Preparing 50,000 test deals in stage-bench-1 for ws-large-1...');

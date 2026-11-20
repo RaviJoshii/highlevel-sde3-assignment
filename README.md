@@ -93,16 +93,19 @@ npm run dev
 
 ### 4. Idempotency & Duplicate Request Prevention
 - Supports explicit client `Idempotency-Key` headers or automatic deterministic SHA-256 fingerprinting.
-- Backed by a compound unique index on `{ workspaceId: 1, idempotencyKey: 1 }` in MongoDB.
+- Client keys are permanent (partial unique index on `{ workspaceId, idempotencyKey }`); the implicit fingerprint dedupes while a job is queued/processing (partial unique index on `{ workspaceId, fingerprint }` where `active`). Key reuse with a different payload returns 409.
+- Filters are validated (primitive types only) and both stages must exist in the workspace pipeline.
 - Replayed or concurrent duplicate requests safely return the existing job handle with HTTP 200 without launching duplicate jobs.
 
 ### 5. Crash Recovery & Resumability
 - Keyset cursor chunking (`_id > cursor`) advances in batches of 500 records.
-- Progress, cursor, and metrics are committed to MongoDB at each chunk boundary.
+- Progress, cursor, and metrics are committed to MongoDB at each chunk boundary, fenced on lease ownership.
+- Moved deals are stamped with `lastBulkJobId`; after a crash, missing transitions are backfilled and counters re-derived (unique `{jobId, opportunityId}` index makes it replay-safe).
+- Transient failures retry with exponential backoff (`MAX_JOB_ATTEMPTS`, `RETRY_BASE_DELAY_MS`); exhausted jobs become `failed`.
 - If a worker dies mid-job (e.g. at 30,000 of 50,000), a recovery worker claims the expired lease and resumes processing from record 30,001. Previously completed records are never re-processed and 0 duplicate transitions are created.
 
 ### 6. Multi-Tenant Isolation & Pacing
-- Enforces a per-workspace concurrency cap (only 1 active bulk job per tenant at a time) to prevent tenant starvation.
+- Enforces a per-workspace concurrency cap (only 1 `processing` bulk job per tenant) with a partial unique index, so it is atomic across workers.
 - 20ms chunk pacing delay yields database I/O and CPU to interactive requests, maintaining sub-20ms p95 latency for interactive operations.
 
 ---

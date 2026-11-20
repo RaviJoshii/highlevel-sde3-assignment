@@ -1,6 +1,6 @@
 import request from 'supertest';
 import { createApp } from '../src/app';
-import { setupTestDB, teardownTestDB } from './setup';
+import { setupTestDB, teardownTestDB, registerWorkspace } from './setup';
 import { Opportunity } from '../src/models/Opportunity';
 import { BulkJob } from '../src/models/BulkJob';
 import { WorkerEngine } from '../src/services/worker.service';
@@ -10,6 +10,8 @@ const app = createApp();
 describe('Requirement 5: Well-behaved & Workspace Isolation', () => {
   beforeAll(async () => {
     await setupTestDB();
+    await registerWorkspace('ws-tenant-A', ['stage-A1','stage-A2','stage-A3']);
+    await registerWorkspace('ws-tenant-B', ['stage-B1','stage-B2']);
 
     // Create 100 deals in ws-tenant-A
     const docsA = Array.from({ length: 100 }).map((_, i) => ({

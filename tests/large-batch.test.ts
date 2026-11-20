@@ -1,6 +1,6 @@
 import request from 'supertest';
 import { createApp } from '../src/app';
-import { setupTestDB, teardownTestDB } from './setup';
+import { setupTestDB, teardownTestDB, registerWorkspace } from './setup';
 import { Opportunity } from '../src/models/Opportunity';
 import { BulkJob } from '../src/models/BulkJob';
 import { config } from '../src/config';
@@ -10,6 +10,7 @@ const app = createApp();
 describe('Requirement 3: Large Batch Handling (50k Limit)', () => {
   beforeAll(async () => {
     await setupTestDB();
+    await registerWorkspace('ws-oversized', ['stage-oversized','stage-normal','stage-target']);
 
     // Insert 50,005 opportunities into stage-oversized
     console.log('[Test Setup] Generating 50,005 opportunities for batch limit test...');

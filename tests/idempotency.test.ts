@@ -1,6 +1,6 @@
 import request from 'supertest';
 import { createApp } from '../src/app';
-import { setupTestDB, teardownTestDB } from './setup';
+import { setupTestDB, teardownTestDB, registerWorkspace } from './setup';
 import { Opportunity } from '../src/models/Opportunity';
 import { BulkJob } from '../src/models/BulkJob';
 
@@ -9,6 +9,7 @@ const app = createApp();
 describe('Requirement 4: Idempotency & Duplicate Request Prevention', () => {
   beforeAll(async () => {
     await setupTestDB();
+    await registerWorkspace('ws-idempotency', ['stage-1','stage-2','stage-3','stage-4']);
 
     // Create 10 sample opportunities
     for (let i = 0; i < 10; i++) {

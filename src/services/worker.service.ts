@@ -6,14 +6,23 @@ import { OpportunityStageTransition } from '../models/OpportunityStageTransition
 import { bulkJobService } from './bulk-job.service';
 import { config } from '../config';
 
+/** Thrown when this worker no longer owns the job's lease (another worker took over). */
+class LeaseLostError extends Error {
+  constructor() {
+    super('LEASE_LOST');
+  }
+}
+
+export type CrashPoint = 'after_bulk_write' | 'after_transitions';
+
 export class WorkerEngine {
   public workerId: string;
   private isRunning: boolean = false;
   private pollTimer: NodeJS.Timeout | null = null;
-  private activeJobs: Set<string> = new Set();
 
-  // Test hook to simulate crash / abrupt termination after processing N records
+  // Test hooks to simulate crash / abrupt termination
   public crashAfterRecords: number | null = null;
+  public crashAt: CrashPoint | null = null;
   public onChunkProcessed?: (job: IBulkJob, chunkCount: number) => void;
 
   constructor(workerId?: string) {
@@ -51,65 +60,87 @@ export class WorkerEngine {
   /**
    * Finds and atomically acquires the next eligible job.
    * Handles:
-   * 1. Newly queued jobs ('queued')
-   * 2. Interrupted/crashed jobs ('processing' with expired lease) -> Crash Recovery!
-   * 3. Tenant fairness: skips jobs for workspaces already running a job on this worker
+   * 1. Newly queued jobs, and retried jobs whose backoff has elapsed
+   * 2. Crashed jobs ('processing' with expired lease) -> crash recovery
+   * 3. Tenant isolation: the partial unique index `one_processing_job_per_workspace`
+   *    makes the "one running job per workspace" cap atomic across all workers
    */
   async claimNextJob(): Promise<IBulkJob | null> {
     const now = new Date();
 
-    // Query candidate jobs
+    // Workspaces with a live job are excluded in the query so a backlog from one
+    // tenant can never fill the candidate window and hide other tenants' jobs.
+    const busyWorkspaces = await BulkJob.distinct('workspaceId', {
+      status: 'processing',
+      leaseExpiresAt: { $gte: now },
+    });
+
     const candidates = await BulkJob.find({
+      workspaceId: { $nin: busyWorkspaces },
       $or: [
-        { status: 'queued' },
-        { status: 'processing', leaseExpiresAt: { $lt: now } }, // Crashed worker recovery
+        { status: 'queued', $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: now } }] },
+        { status: 'processing', leaseExpiresAt: { $lt: now } },
       ],
     })
-      .sort({ createdAt: 1 })
+      .sort({ createdAt: 1, _id: 1 })
       .limit(10)
       .lean();
 
+    const blockedWorkspaces = new Set<string>();
+
     for (const candidate of candidates) {
-      // Per-workspace concurrency isolation: don't process multiple concurrent bulk jobs for the same tenant
-      if (this.activeJobs.has(candidate.workspaceId)) {
+      if (blockedWorkspaces.has(candidate.workspaceId)) continue;
+
+      const isRecovery = candidate.status === 'processing';
+
+      // A job that keeps killing its workers must not be recovered forever
+      if (isRecovery && (candidate.attempts || 0) >= config.maxJobAttempts) {
+        await BulkJob.updateOne(
+          { _id: candidate._id, status: 'processing', leaseExpiresAt: { $lt: now } },
+          {
+            $set: {
+              status: 'failed',
+              active: false,
+              failedAt: now,
+              leaseExpiresAt: null,
+              errorMessage: 'Exceeded max attempts: worker repeatedly failed while processing this job',
+            },
+          }
+        );
         continue;
       }
 
-      // Check if another worker is already processing a job for this workspace
-      const otherActiveForWorkspace = await BulkJob.findOne({
-        workspaceId: candidate.workspaceId,
-        status: 'processing',
-        leaseExpiresAt: { $gte: now },
-        _id: { $ne: candidate._id },
-      });
-
-      if (otherActiveForWorkspace) {
-        continue;
-      }
-
-      // Atomically claim lease on this job
-      const claimedJob = await BulkJob.findOneAndUpdate(
-        {
-          _id: candidate._id,
-          $or: [
-            { status: 'queued' },
-            { status: 'processing', leaseExpiresAt: { $lt: now } },
-          ],
-        },
-        {
-          $set: {
-            status: 'processing',
-            workerId: this.workerId,
-            leaseExpiresAt: new Date(Date.now() + config.leaseDurationMs),
-            lastHeartbeatAt: now,
-            startedAt: candidate.startedAt || now,
+      try {
+        const claimedJob = await BulkJob.findOneAndUpdate(
+          {
+            _id: candidate._id,
+            $or: [
+              { status: 'queued' },
+              { status: 'processing', leaseExpiresAt: { $lt: now } },
+            ],
           },
-        },
-        { new: true }
-      );
+          {
+            $set: {
+              status: 'processing',
+              workerId: this.workerId,
+              leaseExpiresAt: new Date(Date.now() + config.leaseDurationMs),
+              lastHeartbeatAt: now,
+              startedAt: candidate.startedAt || now,
+              nextAttemptAt: null,
+            },
+            ...(isRecovery ? { $inc: { attempts: 1 } } : {}),
+          },
+          { new: true }
+        );
 
-      if (claimedJob) {
-        return claimedJob;
+        if (claimedJob) return claimedJob;
+      } catch (err: any) {
+        // Another job for this workspace is already 'processing' (unique partial index)
+        if (err.code === 11000) {
+          blockedWorkspaces.add(candidate.workspaceId);
+          continue;
+        }
+        throw err;
       }
     }
 
@@ -121,20 +152,16 @@ export class WorkerEngine {
    */
   async processJob(job: IBulkJob): Promise<void> {
     const jobIdStr = job._id.toString();
-    this.activeJobs.add(job.workspaceId);
 
     // Heartbeat timer to periodically renew lease
     const heartbeatTimer = setInterval(async () => {
       try {
-        await BulkJob.updateOne(
-          { _id: job._id, workerId: this.workerId, status: 'processing' },
-          {
-            $set: {
-              lastHeartbeatAt: new Date(),
-              leaseExpiresAt: new Date(Date.now() + config.leaseDurationMs),
-            },
-          }
-        );
+        await BulkJob.updateOne(this.ownerFilter(job), {
+          $set: {
+            lastHeartbeatAt: new Date(),
+            leaseExpiresAt: new Date(Date.now() + config.leaseDurationMs),
+          },
+        });
       } catch (hbErr) {
         console.error(`[Worker ${this.workerId}] Failed to renew lease for job ${jobIdStr}:`, hbErr);
       }
@@ -149,22 +176,121 @@ export class WorkerEngine {
         return;
       }
 
-      console.error(`[Worker ${this.workerId}] Job ${jobIdStr} failed with unrecoverable error:`, err);
-      await BulkJob.updateOne(
-        { _id: job._id },
-        {
-          $set: {
-            status: 'failed',
-            failedAt: new Date(),
-            errorMessage: err.message || 'Unknown processing error',
-            leaseExpiresAt: null,
-          },
-        }
-      );
+      if (err instanceof LeaseLostError) {
+        console.warn(`[Worker ${this.workerId}] Lost lease on job ${jobIdStr}; abandoning it`);
+        return;
+      }
+
+      await this.handleFailure(job, err);
     } finally {
       clearInterval(heartbeatTimer);
-      this.activeJobs.delete(job.workspaceId);
     }
+  }
+
+  /**
+   * Retry with exponential backoff + jitter. Progress (cursor/counters) is kept, so a retry
+   * resumes where the failed attempt stopped. After maxJobAttempts consecutive failures
+   * without progress the job becomes 'failed' instead of retrying forever.
+   */
+  private async handleFailure(job: IBulkJob, err: any): Promise<void> {
+    const message = err?.message || 'Unknown processing error';
+    console.error(`[Worker ${this.workerId}] Job ${job._id} attempt failed:`, err);
+
+    try {
+      const counted = await BulkJob.findOneAndUpdate(
+        this.ownerFilter(job),
+        { $inc: { attempts: 1 }, $set: { errorMessage: message } },
+        { new: true }
+      );
+      if (!counted) return; // lost the lease; the new owner decides
+
+      if (counted.attempts >= config.maxJobAttempts) {
+        await BulkJob.updateOne(this.ownerFilter(job), {
+          $set: {
+            status: 'failed',
+            active: false,
+            failedAt: new Date(),
+            leaseExpiresAt: null,
+          },
+        });
+        return;
+      }
+
+      const backoff = config.retryBaseDelayMs * 2 ** (counted.attempts - 1);
+      const delay = backoff + Math.floor(Math.random() * (backoff / 2 + 1));
+      await BulkJob.updateOne(this.ownerFilter(job), {
+        $set: {
+          status: 'queued',
+          workerId: null,
+          leaseExpiresAt: null,
+          nextAttemptAt: new Date(Date.now() + delay),
+        },
+      });
+    } catch (dbErr) {
+      // Database unreachable: leave the job 'processing'. Its lease expires and it is recovered.
+      console.error(`[Worker ${this.workerId}] Could not record failure for job ${job._id}:`, dbErr);
+    }
+  }
+
+  private ownerFilter(job: IBulkJob) {
+    return { _id: job._id, workerId: this.workerId, status: 'processing' as const };
+  }
+
+  /** Every progress write is fenced on lease ownership so a stale worker cannot corrupt state. */
+  private async commit(job: IBulkJob, update: any): Promise<IBulkJob> {
+    const updated = await BulkJob.findOneAndUpdate(this.ownerFilter(job), update, { new: true });
+    if (!updated) throw new LeaseLostError();
+    return updated;
+  }
+
+  /**
+   * Records transitions. The unique {jobId, opportunityId} index makes this replay-safe:
+   * duplicate-key errors from an earlier (crashed) attempt are ignored.
+   */
+  private async recordTransitions(job: IBulkJob, opportunityIds: Types.ObjectId[], at: Date) {
+    if (opportunityIds.length === 0) return;
+
+    const docs = opportunityIds.map((opportunityId) => ({
+      workspaceId: job.workspaceId,
+      opportunityId,
+      fromStageId: job.filter.stageId,
+      toStageId: job.targetStageId,
+      triggeredBy: 'bulk_job',
+      jobId: job._id,
+      createdAt: at,
+    }));
+
+    try {
+      await OpportunityStageTransition.collection.insertMany(docs, { ordered: false });
+    } catch (err: any) {
+      const writeErrors: any[] = err.writeErrors || [];
+      const onlyDuplicates =
+        writeErrors.length > 0 && writeErrors.every((e) => (e.code ?? e.err?.code) === 11000);
+      if (!onlyDuplicates) throw err;
+    }
+  }
+
+  /**
+   * Crash repair. Deals are stamped with lastBulkJobId in the same write that moves them, so any
+   * deal stamped by this job beyond the committed cursor was moved by a chunk whose transitions /
+   * counters were never committed. Backfill those and re-derive the counters from the truth.
+   */
+  private async repairUncommittedChunk(job: IBulkJob, cursor: Types.ObjectId | null): Promise<void> {
+    const query: any = { workspaceId: job.workspaceId, lastBulkJobId: job._id };
+    if (cursor) query._id = { $gt: cursor };
+
+    const orphans = await Opportunity.find(query).select('_id').lean();
+    if (orphans.length === 0) return;
+
+    await this.recordTransitions(job, orphans.map((o) => o._id as Types.ObjectId), new Date());
+
+    const updatedCount = await OpportunityStageTransition.countDocuments({ jobId: job._id });
+    await this.commit(job, {
+      $set: {
+        updatedCount,
+        processedCount: updatedCount + (job.skippedCount || 0),
+      },
+    });
   }
 
   /**
@@ -176,81 +302,43 @@ export class WorkerEngine {
 
     const baseFilter = bulkJobService.buildFilterQuery(job.workspaceId, job.filter);
 
+    if (job.snapshotMaxId) {
+      await this.repairUncommittedChunk(job, currentCursor);
+    }
+
     while (true) {
-      // Build keyset pagination query
-      const chunkQuery: any = { ...baseFilter };
-
-      if (currentCursor) {
-        chunkQuery._id = { $gt: currentCursor };
-      }
-
-      // Respect snapshot upper bound
-      if (job.snapshotMaxId) {
-        chunkQuery._id = {
-          ...(chunkQuery._id || {}),
-          $lte: job.snapshotMaxId,
-        };
-      }
-
-      // Fetch chunk using covered index: { workspaceId: 1, stageId: 1, _id: 1 }
-      const opportunities = await Opportunity.find(chunkQuery)
-        .sort({ _id: 1 })
-        .limit(config.chunkSize)
-        .lean();
+      // A job whose snapshot matched nothing has no upper bound: never scan the live set
+      const opportunities = job.snapshotMaxId
+        ? await Opportunity.find({
+            ...baseFilter,
+            _id: {
+              ...(currentCursor ? { $gt: currentCursor } : {}),
+              $lte: job.snapshotMaxId,
+            },
+          })
+            .sort({ _id: 1 })
+            .limit(config.chunkSize)
+            .lean()
+        : [];
 
       if (opportunities.length === 0) {
-        // No more records matching snapshot in this stage -> Job complete!
-        // Reconcile any records from initial snapshot that left the filter set
-        const currentJobState = await BulkJob.findById(job._id).lean();
-        const updated = currentJobState?.updatedCount || 0;
-        const currentSkipped = currentJobState?.skippedCount || 0;
-        const total = currentJobState?.totalCount || 0;
-
-        const unaccounted = Math.max(0, total - (updated + currentSkipped));
-        const finalSkipped = currentSkipped + unaccounted;
-        const finalProcessed = Math.max(total, updated + finalSkipped);
-
-        await BulkJob.updateOne(
-          { _id: job._id },
-          {
-            $set: {
-              status: 'completed',
-              completedAt: new Date(),
-              leaseExpiresAt: null,
-              skippedCount: finalSkipped,
-              processedCount: finalProcessed,
-            },
-          }
-        );
-        break;
+        await this.completeJob(job);
+        return;
       }
 
       const bulkOps: any[] = [];
-      const transitionDocs: any[] = [];
-      let chunkSkippedCount = 0;
       const now = new Date();
 
       for (const opp of opportunities) {
-        // REQUIREMENT 1: Manual Edit Handling
-        // Preserves manual stage changes and skips deals manually moved, even if moved A->B->A.
+        // Manual edit handling: a deal touched by a user after submission is never overwritten,
+        // even if it was moved A -> B -> A and therefore matches the filter again.
         const wasManuallyEdited =
           opp.lastManualStageChangeAt &&
           new Date(opp.lastManualStageChangeAt).getTime() >
             new Date(job.snapshotCreatedAt).getTime();
 
-        if (wasManuallyEdited) {
-          chunkSkippedCount++;
-          continue;
-        }
+        if (wasManuallyEdited) continue;
 
-        // REQUIREMENT 2: Target Stage Validation
-        // Avoids unnecessary updates by skipping deals already in the target stage.
-        if (opp.stageId === job.targetStageId) {
-          chunkSkippedCount++;
-          continue;
-        }
-
-        // Prepare atomic update with collision guard
         bulkOps.push({
           updateOne: {
             filter: {
@@ -267,95 +355,64 @@ export class WorkerEngine {
             update: {
               $set: {
                 stageId: job.targetStageId,
+                lastBulkJobId: job._id,
                 updatedAt: now,
               },
               $inc: { version: 1 },
             },
           },
         });
-
-        transitionDocs.push({
-          workspaceId: job.workspaceId,
-          opportunityId: opp._id,
-          fromStageId: opp.stageId,
-          toStageId: job.targetStageId,
-          triggeredBy: 'bulk_job',
-          jobId: job._id,
-          createdAt: now,
-        });
       }
 
-      let chunkUpdatedCount = 0;
+      let movedIds: Types.ObjectId[] = [];
 
       if (bulkOps.length > 0) {
-        const bulkResult = await Opportunity.bulkWrite(bulkOps, { ordered: false });
-        chunkUpdatedCount = bulkResult.modifiedCount || 0;
+        await Opportunity.bulkWrite(bulkOps, { ordered: false });
 
-        // If any records were modified concurrently during chunk execution, adjust skipped count
-        const missedConcurrently = bulkOps.length - chunkUpdatedCount;
-        if (missedConcurrently > 0) {
-          chunkSkippedCount += missedConcurrently;
-        }
+        if (this.crashAt === 'after_bulk_write') throw new Error('SIMULATED_WORKER_CRASH');
 
-        // Only record transitions for opportunities that actually updated
-        // For precision under concurrent conflict:
-        if (chunkUpdatedCount > 0) {
-          // If all updated, insert all transitions
-          if (chunkUpdatedCount === bulkOps.length) {
-            await OpportunityStageTransition.insertMany(transitionDocs, { ordered: false });
-          } else {
-            // Partial chunk conflict: insert transitions only for verified updated IDs
-            const successfullyUpdatedOpps = await Opportunity.find({
-              _id: { $in: bulkOps.map((op) => op.updateOne.filter._id) },
-              stageId: job.targetStageId,
-            })
-              .select('_id')
-              .lean();
+        // The stamp (not stageId) identifies what *this job* moved: a deal a user concurrently
+        // moved into the target stage carries no stamp and gets no bulk_job transition.
+        const moved = await Opportunity.find({
+          _id: { $in: bulkOps.map((op) => op.updateOne.filter._id) },
+          workspaceId: job.workspaceId,
+          lastBulkJobId: job._id,
+        })
+          .select('_id')
+          .lean();
+        movedIds = moved.map((m) => m._id as Types.ObjectId);
 
-            const updatedIdSet = new Set(
-              successfullyUpdatedOpps.map((o) => o._id.toString())
-            );
+        await this.recordTransitions(job, movedIds, now);
 
-            const verifiedTransitions = transitionDocs.filter((t) =>
-              updatedIdSet.has(t.opportunityId.toString())
-            );
-
-            if (verifiedTransitions.length > 0) {
-              await OpportunityStageTransition.insertMany(verifiedTransitions, {
-                ordered: false,
-              });
-            }
-          }
-        }
+        if (this.crashAt === 'after_transitions') throw new Error('SIMULATED_WORKER_CRASH');
       }
 
+      const chunkUpdatedCount = movedIds.length;
+      const chunkSkippedCount = opportunities.length - chunkUpdatedCount;
       const lastOppIdInChunk = opportunities[opportunities.length - 1]._id as Types.ObjectId;
       currentCursor = lastOppIdInChunk;
       recordsProcessedThisSession += opportunities.length;
 
-      // ATOMIC PROGRESS COMMIT: Real committed state survives restarts
-      const updatedJobDoc = await BulkJob.findOneAndUpdate(
-        { _id: job._id },
-        {
-          $set: {
-            cursor: lastOppIdInChunk,
-            lastHeartbeatAt: new Date(),
-            leaseExpiresAt: new Date(Date.now() + config.leaseDurationMs),
-          },
-          $inc: {
-            processedCount: opportunities.length,
-            updatedCount: chunkUpdatedCount,
-            skippedCount: chunkSkippedCount,
-          },
+      // Atomic progress commit (cursor + counters together). A successful chunk also clears the
+      // consecutive-failure counter.
+      const updatedJobDoc = await this.commit(job, {
+        $set: {
+          cursor: lastOppIdInChunk,
+          lastHeartbeatAt: new Date(),
+          leaseExpiresAt: new Date(Date.now() + config.leaseDurationMs),
+          attempts: 0,
         },
-        { new: true }
-      );
+        $inc: {
+          processedCount: opportunities.length,
+          updatedCount: chunkUpdatedCount,
+          skippedCount: chunkSkippedCount,
+        },
+      });
 
-      if (this.onChunkProcessed && updatedJobDoc) {
+      if (this.onChunkProcessed) {
         this.onChunkProcessed(updatedJobDoc, opportunities.length);
       }
 
-      // Check simulated crash hook for testing resumability
       if (
         this.crashAfterRecords !== null &&
         recordsProcessedThisSession >= this.crashAfterRecords
@@ -363,12 +420,37 @@ export class WorkerEngine {
         throw new Error('SIMULATED_WORKER_CRASH');
       }
 
-      // REQUIREMENT 5: Well-behaved pacing delay
-      // Yields CPU & database I/O to interactive user requests
+      // Chunk pacing: yields CPU & database I/O to interactive requests
       if (config.chunkPacingMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, config.chunkPacingMs));
       }
     }
+  }
+
+  /**
+   * Final counters come from committed data (transitions), not from in-memory or incremental
+   * state. Snapshot members that left the filter set (e.g. a user moved them) count as skipped.
+   */
+  private async completeJob(job: IBulkJob): Promise<void> {
+    const updated = await OpportunityStageTransition.countDocuments({ jobId: job._id });
+    const current = await BulkJob.findOne(this.ownerFilter(job)).lean();
+    if (!current) throw new LeaseLostError();
+
+    const total = current.totalCount || 0;
+    const unaccounted = Math.max(0, total - (updated + (current.skippedCount || 0)));
+    const finalSkipped = (current.skippedCount || 0) + unaccounted;
+
+    await this.commit(job, {
+      $set: {
+        status: 'completed',
+        active: false,
+        completedAt: new Date(),
+        leaseExpiresAt: null,
+        updatedCount: updated,
+        skippedCount: finalSkipped,
+        processedCount: Math.max(total, updated + finalSkipped),
+      },
+    });
   }
 
   /**

@@ -10,5 +10,7 @@ export const config = {
   maxBatchSize: parseInt(process.env.MAX_BATCH_SIZE || '50000', 10),
   leaseDurationMs: parseInt(process.env.LEASE_DURATION_MS || '30000', 10),
   heartbeatIntervalMs: parseInt(process.env.HEARTBEAT_INTERVAL_MS || '5000', 10),
+  maxJobAttempts: parseInt(process.env.MAX_JOB_ATTEMPTS || '5', 10),
+  retryBaseDelayMs: parseInt(process.env.RETRY_BASE_DELAY_MS || '1000', 10),
   workerConcurrency: parseInt(process.env.WORKER_CONCURRENCY || '2', 10),
 };

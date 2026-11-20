@@ -12,13 +12,28 @@ export async function setupTestDB() {
     OpportunityStageTransition.deleteMany({}),
     Workspace.deleteMany({}),
   ]);
+  // syncIndexes drops indexes left over from older schema versions (e.g. the non-partial idempotency index)
   await Promise.all([
-    Opportunity.createIndexes(),
-    BulkJob.createIndexes(),
-    OpportunityStageTransition.createIndexes(),
+    Opportunity.syncIndexes(),
+    BulkJob.syncIndexes(),
+    OpportunityStageTransition.syncIndexes(),
   ]);
 }
 
 export async function teardownTestDB() {
   await disconnectDB();
+}
+
+/** Bulk jobs validate stages against the workspace pipeline, so tests must register one. */
+export async function registerWorkspace(workspaceId: string, stageIds: string[]) {
+  await Workspace.updateOne(
+    { _id: workspaceId },
+    {
+      $set: {
+        name: workspaceId,
+        stages: stageIds.map((stageId, i) => ({ stageId, name: stageId, order: i + 1 })),
+      },
+    },
+    { upsert: true }
+  );
 }
