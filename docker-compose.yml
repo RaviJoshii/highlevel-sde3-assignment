@@ -1,11 +1,9 @@
-version: '3.8'
-
 services:
   mongodb:
     image: mongo:7.0
     container_name: opportunities-mongo
     ports:
-      - "27017:27017"
+      - "${MONGO_PORT:-27017}:27017"
     volumes:
       - mongo-data:/data/db
     healthcheck:
@@ -21,7 +19,7 @@ services:
       dockerfile: Dockerfile
     container_name: opportunities-app
     ports:
-      - "3000:3000"
+      - "${PORT:-3000}:3000"
     environment:
       - PORT=3000
       - MONGODB_URI=mongodb://mongodb:27017/opportunities_crm
