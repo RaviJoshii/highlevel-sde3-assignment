@@ -12,11 +12,14 @@ until node -e "const mongoose = require('mongoose'); mongoose.connect(process.en
 done
 echo "[Docker] Connected to MongoDB successfully!"
 
-echo "\n[Docker] Step 1: Running Automated Hard-Scenario Test Suite..."
+echo ""
+echo "[Docker] Step 1: Running Automated Hard-Scenario Test Suite..."
 npm test
 
-echo "\n[Docker] Step 2: Seeding initial dataset..."
+echo ""
+echo "[Docker] Step 2: Seeding initial dataset..."
 npm run seed
 
-echo "\n[Docker] Step 3: Starting Opportunities API & Background Worker Engine..."
+echo ""
+echo "[Docker] Step 3: Starting Opportunities API & Background Worker Engine..."
 npm start
